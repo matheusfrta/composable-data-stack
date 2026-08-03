@@ -15,8 +15,10 @@ issue inventing its own threat assumptions.
 
 **In scope:**
 
-- The CDS CLI itself (`validate` / `plan` / `render` / `test` / `security` /
-  `up`) and the artifacts it produces (rendered Compose files, plans,
+- The CDS CLI itself — currently `validate`, `plan`, `render`, `test`,
+  `security`, and `up`; the list is not exhaustive and additional commands
+  (e.g. `cds diff` (#230), `cds state`) may also touch the boundaries defined
+  in §3 — and the artifacts it produces (rendered Compose files, plans,
   diagnostics).
 - Modules shipped in `modules/` (currently Postgres, Superset, KeyDB, Dagster,
   Vault, and any added afterward) and their generated runtime configuration.
@@ -68,10 +70,6 @@ issue inventing its own threat assumptions.
 ## 3. Trust boundaries
 
 ```mermaid
----
-config:
-  layout: elk
----
 flowchart TB
  subgraph workstation["Operator workstation / CI runner"]
         profileYaml["Profile<br>YAML repo"]
@@ -84,10 +82,10 @@ flowchart TB
         moduleB["module instance B<br>(any category, e.g. BI)"]
         moduleN["module instance N<br>(any category, per profile)"]
   end
- subgraph trustBoundaryA[" "]
+ subgraph trustBoundaryA["Boundary A — CLI/host"]
         dockerDaemon
   end
-    envFile -- "resolved at compose time" --> dockerCompose
+    envFile -- "resolved at compose time<br>(Boundary D)" --> dockerCompose
     profileYaml -- "render/plan" --> cliProcess
     cliProcess -- "writes" --> dockerCompose
     dockerCompose -- "docker compose up" --> trustBoundaryA
@@ -160,8 +158,14 @@ Named boundaries used throughout this document:
 - **Boundary D — secret boundary.** Between the operator's secret store
   (`.env`, environment, or a secrets module like Vault) and everything CDS
   ever writes to disk or stdout. CDS's compile-time code path is designed to
-  never cross this boundary with a resolved value (see `CDS-SEC-006`,
-  `CDS-SEC-030`, `CDS-SEC-071`).
+  never cross this boundary with a resolved value: the actual enforcement is
+  `${CDS_*}` placeholder rendering in `cli/renderer.py` (which emits
+  `${ENV_VAR}` placeholders rather than resolved values) and the regression
+  tests that cover this path. `CDS-SEC-006`, `CDS-SEC-030`, and
+  `CDS-SEC-071` express the same intent as rules but all carry
+  `scope: ["none"]` (and 030/071 are also `enabled: false`), so the rule
+  engine never evaluates them — the placeholder rendering and its tests are
+  the operative control.
 
 ## 4. Threat actors
 
@@ -186,9 +190,9 @@ more of the follow-up issues.
 | # | Attack path | Boundary | Current control | Residual risk / owning issue |
 | --- | --- | --- | --- | --- |
 | T1 | Hardcoded secret committed to a profile/module YAML | D | `CDS-SEC-001`–`004`, `CDS-SEC-033` | Detection only for known patterns; no repo-wide secret scanning in CI. Tracked outside this milestone. |
-| T2 | Resolved secret leaks into `cds plan`/`validate` stdout or a generated Compose file | D | `CDS-SEC-006`, `CDS-SEC-030`, `CDS-SEC-071` | Covered; regression tests exist. Re-verify under #216 process-manager change (new log surfaces). |
+| T2 | Resolved secret leaks into `cds plan`/`validate` stdout or a generated Compose file | D | `${CDS_*}` placeholder rendering in `cli/renderer.py` + regression tests (`CDS-SEC-006`/`030`/`071` are policy intent, not evaluated — all carry `scope: ["none"]`, 030/071 also `enabled: false`) | Covered by placeholder rendering and regression tests. Re-verify under #216 process-manager change (new log surfaces). |
 | T3 | Secret passed via container `command:` args, visible in `docker inspect`/process list | B/D | `CDS-SEC-070` scope bug (issue #297) | **High** — rule currently never fires (dead scope). Needs fix before #206/#216 can rely on it. |
-| T4 | Weak/default/reused credentials (DB, admin UI, cache) | B | `CDS-SEC-010`–`013` | `CDS-SEC-010`'s first branch is dead code (#292); partial coverage only. **Owning issue: #206.** |
+| T4 | Weak/default/reused credentials (DB, admin UI, cache) | B | `CDS-SEC-010`–`013` (`CDS-SEC-013` is `enabled: false`) | `CDS-SEC-010`'s first branch is dead code (#292); `CDS-SEC-013` is not yet evaluated; partial coverage only. **Owning issue: #206.** |
 | T5 | No authentication required on relational DB / cache in production | B | None enforced today; `keydb` password field exists but `connectionUri` doesn't embed it (#291) | **High** — no production-mode enforcement that auth is mandatory. **Owning issue: #206.** |
 | T6 | Env var falls back to an insecure default when unset (`${VAR:-admin}`) | D | `CDS-SEC-040`/`041`, but issue #295 notes `${VAR:-fallback}` with a hardcoded insecure default isn't flagged by `cds preflight` | Medium — partially covered by security rules, gap in preflight. |
 | T7 | Secret provider unreachable/misconfigured, workload silently runs with no secret | D | `CDS-SEC-011` (missing required auth secret) | Covered for known contract fields. |
@@ -206,22 +210,23 @@ more of the follow-up issues.
 
 | # | Attack path | Boundary | Current control | Residual risk / owning issue |
 | --- | --- | --- | --- | --- |
-| T12 | Container runs as root, privilege escalation to host | A | `CDS-SEC-060` (root), `CDS-SEC-061` (privileged/capabilities), automated hardening tests (PR #199) | Covered for CDS-built images; third-party images (e.g. current Postgres/KeyDB upstream, and any future module's upstream image) may still default to root. |
-| T13 | Writable root filesystem allows tampering with running container | A | `CDS-SEC-062` | Covered by rule + hardening tests. |
+| T12 | Container runs as root, privilege escalation to host | A | `CDS-SEC-061` (privileged/capabilities), automated hardening tests (PR #199) (`CDS-SEC-060` is `enabled: false` and not evaluated) | Covered for CDS-built images via SEC-061 and hardening tests; third-party images (e.g. current Postgres/KeyDB upstream, and any future module's upstream image) may still default to root. |
+| T13 | Writable root filesystem allows tampering with running container | A | Automated hardening tests (PR #199) (`CDS-SEC-062` is `enabled: false` and not evaluated) | Covered by hardening tests (PR #199). |
 | T14 | Sensitive host path mounted into a container (e.g. `/`, `/etc`, Docker socket) | A | `CDS-SEC-063` | Covered by rule for known patterns. |
 | T15 | Missing seccomp/AppArmor confinement, container escapes via kernel syscall abuse | A | None enforced today | **Medium-High** — no declarative confinement profile support. **Owning issue: #207.** |
 | T16 | Non-rootless Docker daemon socket exposed, any container-breakout yields host root | A | Documented nowhere yet | **High** for shared/multi-tenant hosts. **Owning issue: #211.** |
-| T17 | Host itself unpatched, exposed daemon API, weak file permissions on `.env`/config | A | `CDS-SEC-032` (secret file permissions) is the only host-adjacent rule | **Medium** — no host hardening baseline published. **Owning issue: #211.** |
+| T17 | Host itself unpatched, exposed daemon API, weak file permissions on `.env`/config | A | `CDS-SEC-032` (secret file permissions) is defined but carries `scope: ["none"]` — not evaluated yet | **Medium** — no host hardening baseline published. **Owning issue: #211.** |
 | T18 | Development web server (e.g. Flask dev server, Django `runserver`) used as the production HTTP entrypoint — no worker model, verbose debug pages, poor concurrency/DoS resistance | A/B | None enforced | **Medium-High.** **Owning issue: #216.** |
 
 ### 5.4 Supply chain
 
 | # | Attack path | Boundary | Current control | Residual risk / owning issue |
 | --- | --- | --- | --- | --- |
-| T19 | Image pulled by `:latest` or unpinned tag, silently changes underneath a deployment | C | `CDS-SEC-050`, `CDS-SEC-053`, `CDS-SEC-054` | Covered by rule. |
+| T19 | Image pulled by `:latest` or unpinned tag, silently changes underneath a deployment | C | `cli/image_verification.py` (`CDS-SEC-050`, `CDS-SEC-053`, `CDS-SEC-054` are defined but carry `scope: ["none"]` — not evaluated by the rule engine; enforcement is in `cli/image_verification.py`) | Covered by `cli/image_verification.py`. |
 | T20 | Image pulled without a digest pin, tag can be repointed at the registry | C | `CDS-SEC-051` | Covered by rule. |
 | T21 | Image pulled from an untrusted/typo-squatted registry | C | `CDS-SEC-052`, case-insensitive allowlist (PR #337) | Covered. |
 | T22 | Image signature/provenance not verified — a tampered image is deployed with a valid-looking tag/digest | C | `cli/image_verification.py` (CDS-VER-001/002), cosign + fixture fallback (PR #330) | Covered for `full` mode; **gap:** default policy mode may be `off`/`policy` outside production — verify defaults match #206/#216 auth requirements. |
+| T22a | Insider with repo write access sets `signed: true` in `tests/fixtures/signed-images.json` for a backdoored image, causing `cds security --verify-images` (`full` mode) to trust it without a real cosign check | C/A | None — `cli/image_verification.py` trusts the fixture at face value when a matching entry is found and the registry is allowed | **High** (insider threat, §4). The fixture is a normal repo file; any committer can flip it. **Owning issue: #209 or a new dedicated issue.** |
 | T23 | New CVE disclosed in an already-deployed base image; no rescanning after initial CI scan | C | One-time scan in CI (`image-security-scan.yml`, PR from #71); no scheduled rescanning | **High** — no continuous rescanning. **Owning issue: #209.** |
 | T24 | Compromised CI job forges a signature using the repo's OIDC identity | C | Keyless OIDC cert-identity regexp scoped to `publish-images.yml@refs/heads/main` (fixed in review of #330) | Covered, assuming branch protection prevents arbitrary workflow edits on `main`. |
 | T25 | SBOM/vulnerability report tampered with or not retained, hiding a known-bad image after the fact | C | SBOM generation exists (#71); retention/immutability not modeled here | Medium — out of explicit scope for this document, flag for #209. |
@@ -243,7 +248,7 @@ follow-up issue:
    network segmentation, no TLS, non-rootless daemon exposure, and no
    backup/restore path are the highest-impact gaps because each allows a
    single compromised or misconfigured service to fully compromise
-   confidentiality or availability of the whole stack. Owners: #206, #070,
+   confidentiality or availability of the whole stack. Owners: #206, #70,
    #205, #211, #210.
 2. **T3 / T4** — dead/buggy security rules (`CDS-SEC-070` never fires,
    `CDS-SEC-010`'s first branch is dead code) give false confidence that
@@ -303,7 +308,10 @@ follow-up issue:
 7. **Supply-chain verification testing.** Attempt to deploy a tampered image
    with a forged tag/digest and confirm `cds security --verify-images`
    rejects it; confirm a `latest`/unpinned tag is flagged before reaching
-   this phase (validates T19–T22, T24).
+   this phase; also tamper with `tests/fixtures/signed-images.json` directly
+   (e.g. set `signed: true` for an unsigned or backdoored digest) to confirm
+   the fixture-bypass path identified as T22a is either blocked or detected
+   (validates T19–T22, T22a, T24).
 8. **Backup/restore drill.** Trigger a full data-loss simulation (destroy the
    warehouse volume) and time the restore against the RPO/RTO targets defined
    once #210 lands (validates T26, T27).
@@ -322,8 +330,10 @@ follow-up issue:
   against a shared or production host.
 - Supply-chain testing: reuses CDS's own `cds security --verify-images` and
   `cosign` tooling as the primary detection surface, plus manual crafting of
-  a deliberately non-compliant image/fixture to confirm fail-closed behavior
-  (mirrors the existing regression-test pattern in
+  a deliberately non-compliant image and direct mutation of
+  `tests/fixtures/signed-images.json` (e.g. marking a tampered digest as
+  `signed: true`) to confirm fail-closed behavior in both the image-crafting
+  and fixture-tampering paths (mirrors the existing regression-test pattern in
   `tests/test_image_verification.py`).
 - No fuzzing or DoS testing against any shared CI or registry infrastructure.
 
